@@ -1,8 +1,7 @@
-from __future__ import annotations
 import numpy as np
 
 
-def build_binary_ops(this, that, values, grad_fn_1, grad_fn_2):
+def build_binary_ops(this, that, grad_fn_1, grad_fn_2, values):
     requires_grad = this.requires_grad or that.requires_grad
     dependency = []
     if this.requires_grad:
@@ -12,7 +11,7 @@ def build_binary_ops(this, that, values, grad_fn_1, grad_fn_2):
     return this.__class__(values, requires_grad, dependency)
 
 
-def build_unary_ops(this, values, grad_fn):
+def build_unary_ops(this, grad_fn, values):
     dependency = [dict(tensor=this, grad_fn=grad_fn)] if this.requires_grad else []
     return this.__class__(values, this.requires_grad, dependency)
 
@@ -28,6 +27,9 @@ def as_tensor(obj):
     if not isinstance(obj, Tensor):
         obj = Tensor(obj)
     return obj
+
+def register_op(func):
+    setattr(Tensor, func.__name__, func)
 
 
 class Tensor:
@@ -70,121 +72,155 @@ class Tensor:
         return "Tensor" + self._values.__repr__()[5:]
 
     def __matmul__(self, other):
-        other = as_tensor(other)
+        """ self @ other """
+        return _matmul(self, as_tensor(other))
 
-        def grad_fn_1(grad):
-            return np_matmul(grad, other.values.T)
-
-        def grad_fn_2(grad):
-            return np_matmul(self.values.T, grad)
-
-        return build_binary_ops(
-            self, other, np_matmul(self.values, other.values),
-            grad_fn_1, grad_fn_2)
+    def __rmatmul__(self, other):
+        """ other @ self """
+        return _matmul(as_tensor(other), self)
 
     def __mul__(self, other):
-        other = as_tensor(other)
-        # return build_binary_ops(
-        # 	self, other, self.values * other.values,
-        # 	lambda grad: other.values.T,
-        # 	lambda grad: self.values.T)
-        values = self.values * other.values
+        """ self * other """
+        return _mul(self, as_tensor(other))
 
-        def grad_fn_ts1(grad):
-            grad = grad * other.values
-            for _ in range(grad.ndim - self.values.ndim):
-                grad = grad.sum(axis=0)
-            for i, dim in enumerate(self.shape):
-                if dim == 1:
-                    grad = grad.sum(axis=i, keepdims=True)
-            return grad
-
-        def grad_fn_ts2(grad):
-            grad = grad * self.values
-            for _ in range(grad.ndim - other.values.ndim):
-                grad = grad.sum(axis=0)
-            for i, dim in enumerate(other.shape):
-                if dim == 1:
-                    grad = grad.sum(axis=i, keepdims=True)
-            return grad
-
-        return build_binary_ops(self, other, values, grad_fn_ts1, grad_fn_ts2)
+    def __rmul__(self, other):
+        """ other * self """
+        return _mul(as_tensor(other), self)
 
     def __neg__(self):
-        values = -self.values
-        return build_unary_ops(self, values, lambda grad: -grad)
+        """ -self """
+        return _neg(self)
 
-    def __add__(ts1, ts2):
-        ts2 = as_tensor(ts2)
-        values = ts1.values + ts2.values
+    def __add__(self, other):
+        """ self + other """
+        return _add(self, as_tensor(other))
 
-        # c = a + b
-        # D_c / D_a = 1.0
-        # D_c / D_b = 1.0
-        def grad_fn_ts1(grad):
-            # handle broadcasting (5, 3) + (3,) -> (5, 3)
-            for _ in range(grad.ndim - ts1.values.ndim):
-                grad = grad.sum(axis=0)
-            # handle broadcasting (5, 3) + (1, 3) -> (5, 3)
-            for i, dim in enumerate(ts1.shape):
-                if dim == 1:
-                    grad = grad.sum(axis=i, keepdims=True)
-            return grad
-            # return grad * np.ones_like(ts2)
-
-        def grad_fn_ts2(grad):
-            for _ in range(grad.ndim - ts2.values.ndim):
-                grad = grad.sum(axis=0)
-            for i, dim in enumerate(ts2.shape):
-                if dim == 1:
-                    grad = grad.sum(axis=i, keepdims=True)
-            return grad
-            # return grad * np.ones_like(ts1)
-
-        return build_binary_ops(
-            ts1, ts2, values, grad_fn_ts1, grad_fn_ts2)
+    def __radd__(self, other):
+        """ other + self """
+        return _add(as_tensor(other), self)
 
     def __sub__(self, other):
-        other = as_tensor(other)
-        return self.__add__(-other)
+        """ self - other """
+        return _add(self, -as_tensor(other))
 
-    # sum函数的axis制定了被reduce的轴，所以需要先expand_dims回来
-    # 对于mean函数，除以了这个轴上求和的元素总数，即shape[axis]
-    # x.shape => (2, 3, 4)
-    # y = x.mean(axis=0)
-    # y.shape => (3, 4)
-    # z = np.expand_dims(y, 0)
-    # z.shape => (1, 3, 4)
-    # np.repeat(z, 2, 0) => (2, 3, 4)
-    # 由于y中每个元素是由2个元素求的平均，grad还要除以2
-    def reduce_sum(self, axis=None):
-        values = self.values.sum(axis=axis)
-        if axis is not None:
-            repeat = self.values.shape[axis]
-
-        def grad_fn(grad):
-            if axis is None:
-                grad = grad * np.ones_like(self.values)
-            else:
-                grad = np.expand_dims(grad, axis)
-                grad = np.repeat(grad, repeat, axis)
-                print(grad)
-            return grad
-
-        return build_unary_ops(self, values, grad_fn)
+    def __rsub__(self, other):
+        """ other - self """
+        return _add(-as_tensor(other), self)
 
     def reduce_mean(self, axis=None):
-        values = self.values.mean(axis=axis)
+        """ self.reduce_mean(axis=x) """
+        return _reduce_mean(self, axis)
 
-        if axis is not None:
-            repeat = self.values.shape[axis]
+    def reduce_sum(self, axis=None):
+        """ self.reduce_sum(axis=x) """
+        return _reduce_sum(self, axis)
 
-        def grad_fn(grad):
-            if axis is None:
-                grad = grad / self.values.size * np.ones_like(self.values)
-            else:
-                grad = np.expand_dims(grad / repeat, axis)
-                grad = np.repeat(grad, repeat, axis)
-            return grad
 
-        return build_unary_ops(self, values, grad_fn)
+def _mul(operand_1, operand_2):
+    def grad_fn_1(grad):
+        grad = grad * operand_2.values
+        for _ in range(grad.ndim - operand_1.values.ndim):
+            grad = grad.sum(axis=0)
+        for i, dim in enumerate(operand_1.shape):
+            if dim == 1:
+                grad = grad.sum(axis=i, keepdims=True)
+        return grad
+
+    def grad_fn_2(grad):
+        grad = grad * operand_1.values
+        for _ in range(grad.ndim - operand_2.values.ndim):
+            grad = grad.sum(axis=0)
+        for i, dim in enumerate(operand_2.shape):
+            if dim == 1:
+                grad = grad.sum(axis=i, keepdims=True)
+        return grad
+
+    return build_binary_ops(
+        operand_1, operand_2, grad_fn_1, grad_fn_2,
+        operand_1.values * operand_2.values)
+
+
+def _matmul(operand_1, operand_2):
+    def grad_fn_1(grad):
+        return np_matmul(grad, operand_2.values.T)
+
+    def grad_fn_2(grad):
+        return np_matmul(operand_1.values.T, grad)
+
+    return build_binary_ops(
+        operand_1, operand_2, grad_fn_1, grad_fn_2,
+        np_matmul(operand_1.values, operand_2.values))
+
+
+def _neg(operand_1):
+    return build_unary_ops(operand_1, lambda grad: -grad, -operand_1.values)
+
+
+def _add(operand_1, operand_2):
+    # c = a + b
+    # D_c / D_a = 1.0
+    # D_c / D_b = 1.0
+    def grad_fn_1(grad):
+        # handle broadcasting (5, 3) + (3,) -> (5, 3)
+        for _ in range(grad.ndim - operand_1.values.ndim):
+            grad = grad.sum(axis=0)
+        # handle broadcasting (5, 3) + (1, 3) -> (5, 3)
+        for i, dim in enumerate(operand_1.shape):
+            if dim == 1:
+                grad = grad.sum(axis=i, keepdims=True)
+        return grad
+
+    def grad_fn_2(grad):
+        for _ in range(grad.ndim - operand_2.values.ndim):
+            grad = grad.sum(axis=0)
+        for i, dim in enumerate(operand_2.shape):
+            if dim == 1:
+                grad = grad.sum(axis=i, keepdims=True)
+        return grad
+
+    return build_binary_ops(
+        operand_1, operand_2, grad_fn_1, grad_fn_2,
+        operand_1.values + operand_2.values)
+
+
+# sum函数的axis制定了被reduce的轴，所以需要先expand_dims回来
+# 对于mean函数，除以了这个轴上求和的元素总数，即shape[axis]
+# x.shape => (2, 3, 4)
+# y = x.mean(axis=0)
+# y.shape => (3, 4)
+# z = np.expand_dims(y, 0)
+# z.shape => (1, 3, 4)
+# np.repeat(z, 2, 0) => (2, 3, 4)
+# 由于y中每个元素是由2个元素求的平均，grad还要除以2
+def _reduce_sum(operand_1, axis=None):
+    if axis is not None:
+        repeat = operand_1.values.shape[axis]
+
+    def grad_fn(grad):
+        if axis is None:
+            grad = grad * np.ones_like(operand_1.values)
+        else:
+            grad = np.expand_dims(grad, axis)
+            grad = np.repeat(grad, repeat, axis)
+            print(grad)
+        return grad
+
+    return build_unary_ops(
+        operand_1, grad_fn, operand_1.values.sum(axis=axis))
+
+
+def _reduce_mean(operand_1, axis=None):
+    values = operand_1.values.mean(axis=axis)
+
+    if axis is not None:
+        repeat = operand_1.values.shape[axis]
+
+    def grad_fn(grad):
+        if axis is None:
+            grad = grad / operand_1.values.size * np.ones_like(operand_1.values)
+        else:
+            grad = np.expand_dims(grad / repeat, axis)
+            grad = np.repeat(grad, repeat, axis)
+        return grad
+
+    return build_unary_ops(operand_1, grad_fn, values)
